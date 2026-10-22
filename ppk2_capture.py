@@ -17,10 +17,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import serial
 import serial.tools.list_ports
 from ppk2_api.ppk2_api import PPK2_API
 
 MEASUREMENTS_DIR = Path(__file__).resolve().parent / "measurements"
+REGULATOR_SETTLE_S = 0.5  # wait after setting the source voltage before switching the DUT on
 PPK2_SAMPLE_RATE = 100_000  # Hz, fixed by the hardware
 VOLTAGE_MIN, VOLTAGE_MAX = 800, 5000  # mV, PPK2 regulator range
 
@@ -58,6 +60,7 @@ class Progress:
         self.last_sum = 0.0
         self.last_n = 0
         self.now_txt = "       -   "
+        self.dut = None  # "on"/"off" when the DUT power is switched during the measurement
 
     def update(self, i_sum, n_total, force=False):
         now = time.monotonic()
@@ -75,7 +78,8 @@ class Progress:
         if n:
             self.now_txt = fmt_current((i_sum - self.last_sum) / n)
         avg_txt = fmt_current(i_sum / n_total) if n_total else "       -   "
-        sys.stderr.write(f"\r{head}  now {self.now_txt}  avg {avg_txt} ")
+        dut_txt = f"  DUT {self.dut:3}" if self.dut else ""
+        sys.stderr.write(f"\r{head}  now {self.now_txt}  avg {avg_txt}{dut_txt} ")
         sys.stderr.flush()
         self.t_last, self.last_sum, self.last_n = now, i_sum, n_total
 
@@ -119,7 +123,10 @@ def open_ppk2(port, mode=None, voltage_mv=None):
         if not ports:
             raise SystemExit("Error: no PPK2 found (check with `make check-ppk`)")
         port = ports[0].device
-    ppk2 = PPK2_API(port, timeout=1, write_timeout=1, exclusive=True)
+    try:
+        ppk2 = PPK2_API(port, timeout=1, write_timeout=1, exclusive=True)
+    except serial.SerialException as e:
+        raise SystemExit(f"Error: cannot open PPK2 {port}, is power-on or another measurement running? ({e})")
     # A previous (aborted) session may have left the device streaming: stop it and flush
     ppk2.stop_measuring()
     drain(ppk2)
@@ -131,20 +138,26 @@ def open_ppk2(port, mode=None, voltage_mv=None):
     if voltage_mv is not None:
         # In ampere mode this is the expected supply voltage of the DUT (used for calibration)
         ppk2.set_source_voltage(voltage_mv)
+        if mode == "source":
+            # Measured: DUT power ON only takes effect ~315 ms after REGULATOR_SET (1-2 ms after 0.5 s)
+            time.sleep(REGULATOR_SETTLE_S)
     return ppk2, port
 
 
 def cmd_power_on(args):
+    # The PPK2 switches the DUT off when its serial port is closed, so power-on keeps
+    # the port open (and the DUT powered) until it gets SIGINT/SIGTERM.
     ppk2, port = open_ppk2(args.port, "source", args.voltage)
-    ppk2.toggle_DUT_power("ON")
-    log(f"PPK2 {port}: DUT power ON ({args.voltage} mV)")
-    return 0
-
-
-def cmd_power_off(args):
-    ppk2, port = open_ppk2(args.port)
-    ppk2.toggle_DUT_power("OFF")
-    log(f"PPK2 {port}: DUT power OFF")
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    try:
+        ppk2.toggle_DUT_power("ON")
+        log(f"PPK2 {port}: DUT power ON ({args.voltage} mV), Ctrl+C to switch off")
+        stop.wait()
+    finally:
+        ppk2.toggle_DUT_power("OFF")
+        log(f"PPK2 {port}: DUT power OFF")
     return 0
 
 
@@ -153,7 +166,7 @@ def cmd_measure(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     base = out_dir / (f"{stamp}_{args.name}" if args.name else stamp)
-    csv_path, json_path = base.with_suffix(".csv"), base.with_suffix(".json")
+    csv_path, json_path = base.parent / (base.name + ".csv"), base.parent / (base.name + ".json")
 
     window = PPK2_SAMPLE_RATE // args.frequency
     rate = args.frequency
@@ -165,8 +178,14 @@ def cmd_measure(args):
         signal.signal(sig, lambda *_: stop.set())
 
     if args.mode == "source":
-        ppk2.toggle_DUT_power("ON")
-        time.sleep(args.settle)
+        if args.settle is not None:
+            ppk2.toggle_DUT_power("ON")
+            log(f"DUT power ON, settling {args.settle:g} s before recording")
+            if stop.wait(args.settle):
+                ppk2.toggle_DUT_power("OFF")
+                raise SystemExit("Aborted while settling, nothing recorded")
+        else:
+            ppk2.toggle_DUT_power("OFF")  # measure from a cold start, switched on by power_on below
 
     # Reader thread only drains the serial port so no data is lost; parsing happens here.
     chunks = queue.Queue()
@@ -181,6 +200,11 @@ def cmd_measure(args):
 
     duration_txt = f"{args.duration} s" if args.duration > 0 else "until SIGINT/SIGTERM"
     log(f"PPK2 {port}: {args.mode} mode, {args.voltage} mV, {rate:g} Hz output, {duration_txt}")
+    if args.power_on_delay is not None:
+        if args.power_on_delay == 0:
+            log("DUT power ON with the start of the recording (start-up included)")
+        else:
+            log(f"DUT power is OFF, switching ON at {args.power_on_delay:g} s")
     log(f"Writing {display_path(csv_path)}")
 
     started = datetime.now().astimezone()
@@ -189,6 +213,20 @@ def cmd_measure(args):
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
     progress = Progress(args.duration)
+
+    power_on_at = None
+    power_timer = None
+    if args.power_on_delay is not None:
+        progress.dut = "off"
+
+        def power_on():
+            nonlocal power_on_at
+            ppk2.toggle_DUT_power("ON")
+            power_on_at = time.monotonic() - t_start
+            progress.dut = "on"
+
+        power_timer = threading.Timer(args.power_on_delay, power_on)
+        power_timer.start()
 
     n_total = n_rows = 0
     i_sum = 0.0
@@ -230,13 +268,15 @@ def cmd_measure(args):
             if stop.is_set():
                 thread.join()
 
+        if power_timer:
+            power_timer.cancel()
         ppk2.stop_measuring()
         while not chunks.empty():
             consume(chunks.get())
         drain(ppk2)
         progress.finish(i_sum, n_total)
 
-    if args.mode == "source" and not args.keep_power:
+    if args.mode == "source":
         ppk2.toggle_DUT_power("OFF")
 
     duration_s = n_total / PPK2_SAMPLE_RATE
@@ -252,6 +292,8 @@ def cmd_measure(args):
         "samples": n_total,
         "rows": n_rows,
         "frequency_Hz": rate,
+        "settle_s": args.settle,
+        "power_on_at_s": round(power_on_at, 3) if power_on_at is not None else None,
         "avg_uA": round(avg_ua, 3) if avg_ua is not None else None,
         "min_uA": round(i_min, 3) if n_total else None,
         "max_uA": round(i_max, 3) if n_total else None,
@@ -274,6 +316,13 @@ def duration(text):
     s = float(text)
     if s < 0:
         raise argparse.ArgumentTypeError("must be >= 0 (0 = until SIGINT/SIGTERM)")
+    return s
+
+
+def delay(text):
+    s = float(text)
+    if s < 0:
+        raise argparse.ArgumentTypeError("must be >= 0 seconds")
     return s
 
 
@@ -307,17 +356,27 @@ def main():
                    help=f"CSV rows per second (averaged), must divide {PPK2_SAMPLE_RATE}; {PPK2_SAMPLE_RATE} = raw")
     m.add_argument("-n", "--name", type=name, help="label appended to the file name")
     m.add_argument("-o", "--out-dir", default=MEASUREMENTS_DIR, help="output directory (default: measurements/ in this repo)")
-    m.add_argument("--settle", type=float, default=0.5, help="seconds to wait after powering the DUT before measuring (default: 0.5)")
-    m.add_argument("--keep-power", action="store_true", help="leave DUT power on after the measurement (source mode)")
+    m.add_argument("--settle", type=delay, metavar="SECONDS",
+                   help="source mode: switch the DUT ON, wait SECONDS unrecorded, then record (steady state, no start-up)")
+    m.add_argument("--power-on-delay", type=delay, metavar="SECONDS",
+                   help="source mode: start with the DUT OFF and switch it ON SECONDS into the recording (start-up included, default: 0)")
     m.set_defaults(func=cmd_measure)
 
-    on = sub.add_parser("power-on", help="power the DUT from the PPK2 (source mode)")
+    on = sub.add_parser("power-on", help="bench supply: power the DUT until SIGINT/SIGTERM")
     on.add_argument("-v", "--voltage", required=True, type=voltage, help=f"output voltage in mV, {VOLTAGE_MIN}-{VOLTAGE_MAX}")
     on.set_defaults(func=cmd_power_on)
 
-    sub.add_parser("power-off", help="switch DUT power off").set_defaults(func=cmd_power_off)
-
     args = p.parse_args()
+    if args.cmd == "measure":
+        given = [o for o, v in (("--settle", args.settle), ("--power-on-delay", args.power_on_delay)) if v is not None]
+        if args.mode == "ampere" and given:
+            p.error(f"{given[0]} only works in source mode (the PPK2 must power the DUT)")
+        if len(given) > 1:
+            p.error("give either --settle or --power-on-delay, not both")
+        if args.mode == "source" and not given:
+            args.power_on_delay = 0.0  # default: switch on with the recording, start-up included like a normal supply
+        if args.power_on_delay is not None and args.duration and args.power_on_delay >= args.duration:
+            p.error("--power-on-delay must be smaller than --duration")
     sys.exit(args.func(args))
 
 

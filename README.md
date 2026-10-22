@@ -3,6 +3,8 @@
 - [1. Requirements](#1-requirements)
 - [2. Installation](#2-installation)
 - [3. Usage](#3-usage)
+  - [Source mode: start-up or steady state?](#source-mode-start-up-or-steady-state)
+  - [Bench supply](#bench-supply)
 - [4. Output format](#4-output-format)
 - [5. Triggering from other tools / agents](#5-triggering-from-other-tools--agents)
 
@@ -57,27 +59,34 @@ A missing or invalid parameter aborts before the PPK2 is touched!
 
 ```bash
 $ make help
+Makefile targets for the Nordic Power Profiler Kit II (PPK2)
+Usage: make [target] [VAR=value ...]
+
 Targets:
   help                  Show this help message
   install               Create the Python venv and install requirements (ppk2-api)
-  check-ppk             Check the PPK2 (USB 1915:c00a, venv, serial port, permissions) and list its port(s)
-  measure-voltage       Source meter: PPK2 POWERS the DUT at VOLTAGE (VOLTAGE DURATION FREQUENCY [NAME])
-  measure-ampere        Ampere meter: PPK2 in series, DUT has its own supply (VOLTAGE DURATION FREQUENCY [NAME])
-  power-on              Power the DUT from the PPK2 at VOLTAGE mV, no measurement (VOLTAGE)
-  power-off             Turn DUT power off
-  summary               Show the JSON summary of the latest measurement, or the latest one named NAME ([NAME])
-  clean                 Delete ALL measurements in measurements/ (keeps .gitkeep and the venv)
+  check-ppk             Check the attached PPK2 (USB 1915:c00a) and list its port(s)
+  measure-voltage       Source meter: PPK2 POWERS the DUT at VOLTAGE DURATION FREQUENCY [SETTLE] [POWER_ON_DELAY] [NAME]
+  measure-ampere        Ampere meter: PPK2 in series, DUT has its own supply VOLTAGE DURATION FREQUENCY [NAME]
+  power-on              power the DUT at VOLTAGE until Ctrl+C
+  summary               Show the JSON summary of the latest measurement [NAME]
+  clean                 Delete ALL measurements in measurements/
 
-Parameters (required = no default, must be given):
+Parameters:
   VOLTAGE=mV        required  800-5000 (integer)
   DURATION=seconds  required  seconds, decimals allowed (e.g. 2.5); 0 = until Ctrl+C / SIGTERM
   FREQUENCY=Hz      required  1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000
   NAME=string       optional  label in the file name, letters/digits/._- only
+  POWER_ON_DELAY=s  optional  DUT starts OFF, switched ON s seconds into the recording (< DURATION).
+  SETTLE=s          optional  DUT switched ON, runs s seconds UNRECORDED, then recording starts.
   PORT=/dev/ttyACMx optional  PPK2 serial port (default: auto-detect)
 
 Examples:
   make measure-voltage VOLTAGE=3300 DURATION=10 FREQUENCY=1000 NAME=idle
-  make measure-ampere  VOLTAGE=1800 DURATION=60 FREQUENCY=100
+  make measure-voltage VOLTAGE=3300 DURATION=10 FREQUENCY=1000 SETTLE=2 NAME=settled
+  make measure-voltage VOLTAGE=3300 DURATION=5 FREQUENCY=10000 POWER_ON_DELAY=1 NAME=boot
+  make measure-ampere  VOLTAGE=1800 DURATION=60 FREQUENCY=100 NAME=current
+  make power-on VOLTAGE=3300     (bench supply until Ctrl+C)
 ```
 
 | Target | Mode | Wiring |
@@ -89,8 +98,10 @@ Examples:
 |-----------|----------|--------------|---------|
 | `VOLTAGE` | yes | 800–5000 (mV, integer) | `measure-voltage`/`power-on`: output voltage to the DUT. `measure-ampere`: the DUT's supply voltage. It is not output, only used for calibration and `energy_mJ`. |
 | `DURATION` | yes | seconds, decimals allowed; `0` | Measurement length. `0` = until `SIGINT`/`SIGTERM` (Ctrl+C / `kill`). |
-| `FREQUENCY` | yes | divisor of 100000: 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000 | CSV rows per second. The PPK2 always samples at 100 kHz, and each row is the mean of 100000/`FREQUENCY` samples. `100000` = raw. |
+| `FREQUENCY` | yes | 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000 | CSV rows per second. The PPK2 always samples at 100 kHz, and each row is the mean of 100000/`FREQUENCY` samples. `100000` = raw. |
 | `NAME` | no | letters, digits, `.` `_` `-` | Label added to the file name. |
+| `POWER_ON_DELAY` | no, `measure-voltage` only, not with `SETTLE` | seconds ≥ 0, < `DURATION` | Start with the DUT **off**, switch it on after this many seconds. The start-up is recorded. |
+| `SETTLE` | no, `measure-voltage` only, not with `POWER_ON_DELAY` | seconds ≥ 0 | Switch the DUT on, let it run this many seconds **unrecorded**, then record. Steady state only. |
 | `PORT` | no | e.g. `/dev/ttyACM1` | Serial port (default: auto-detect). |
 
 While measuring, a live status line shows elapsed/total time, the current of the last second (`now`) and the running
@@ -100,12 +111,50 @@ average (`avg`). It is only drawn when stderr is a terminal, so redirected or pi
    4.2 / 10.0 s [########------------]  42%  now    1.523 mA  avg    1.498 mA
 ```
 
-In **source mode** (`measure-voltage`) the DUT is powered on, the script waits 0.5 s to let it settle (`--settle`), then
-measures. Afterwards the DUT is powered **off** again, unless the script is called with `--keep-power`.
+### Source mode: start-up or steady state?
 
-The script can also be called directly, with the same required arguments:
-`.venv/bin/python ppk2_capture.py measure --mode source --voltage 3300 --duration 10 --frequency 1000`
-(see `.venv/bin/python ppk2_capture.py measure --help`).
+`measure-voltage` powers the DUT itself, so every measurement is a full power cycle: switch on, record, switch off.
+By default the DUT is switched on together with the start of the recording, so the inrush current and the start-up
+are in the data, like with a normal power supply. Optionally **one** of these changes that:
+
+| | default | `POWER_ON_DELAY=s` | `SETTLE=s` |
+|---|---|---|---|
+| DUT at start of recording | switched on (1–2 ms) | off, on after `s` seconds | already on for `s` seconds |
+| inrush current / boot in the CSV | **yes** | **yes**, plus off baseline | **no** |
+| use for | start-up + operation | clear before/after comparison | idle/sleep current, steady-state averages |
+
+```bash
+$ make measure-voltage VOLTAGE=3300 DURATION=10 FREQUENCY=1000                    NAME=run    # with start-up
+$ make measure-voltage VOLTAGE=3300 DURATION=5  FREQUENCY=10000 POWER_ON_DELAY=1  NAME=boot   # off baseline first
+$ make measure-voltage VOLTAGE=3300 DURATION=10 FREQUENCY=1000  SETTLE=2          NAME=idle   # steady state only
+```
+
+The PPK2 can't keep the DUT powered between two commands (see [Bench supply](#bench-supply)). To measure a DUT that has
+been running for a while, use `SETTLE`, e.g. `SETTLE=60`.
+
+**Measuring a clean start-up:** with `POWER_ON_DELAY=s`, the measurement starts with the DUT **off** and the PPK2 switches
+it on `s` seconds into the measurement. The CSV then contains the off baseline, the inrush current and the complete
+boot. The actual switch-on time is stored as `power_on_at_s` in the JSON. That is the time the Pi sent the command, so the
+current jump in the CSV is the exact reference.
+The status line shows `DUT off`/`DUT on`. Note that `avg_uA`, `charge_uC` and `energy_mJ` include the off phase.
+Use a high `FREQUENCY` (e.g. 10000 or 100000) to resolve the inrush current.
+Measured with the test DUT, the current starts 1–2 ms after the command.
+
+Before switching on, the script waits 0.5 s after setting the voltage. Measured: right after the voltage is set, the
+PPK2 delays the switch-on by ~315 ms, presumably because the regulator is still ramping.
+
+### Bench supply
+
+```bash
+$ make power-on VOLTAGE=3300          # DUT powered until Ctrl+C
+```
+
+The PPK2 switches the DUT **off as soon as its serial port is closed**. So `power-on` keeps running and holds the port
+until Ctrl+C (or SIGTERM). If `power-on` is killed hard (`kill -9`, crash), the port is closed and the PPK2 switches the
+DUT off by itself.
+
+While `power-on` runs, no measurement is possible (the port is in use, `measure-*` reports that). For a powered DUT
+**with** recording, use `measure-voltage ... DURATION=0`, which runs until Ctrl+C.
 
 ## 4. Output format
 
@@ -139,6 +188,8 @@ time_s,current_uA,logic
   "samples": 199520,
   "rows": 1995,
   "frequency_Hz": 1000,
+  "settle_s": null,
+  "power_on_at_s": null,
   "avg_uA": 12.466,
   "min_uA": 1.549,
   "max_uA": 4210.028,
@@ -157,7 +208,7 @@ if no samples were captured:
 
 ```bash
 # Fixed-length measurement, parse the result
-$ make -s measure-voltage VOLTAGE=3300 DURATION=20 FREQUENCY=1000 NAME=boot 2>/dev/null | jq .avg_uA
+$ make -s measure-voltage VOLTAGE=3300 DURATION=20 FREQUENCY=1000 SETTLE=1 NAME=idle 2>/dev/null | jq .avg_uA
 
 # Open-ended: start in the background, run the workload, stop the capture
 $ make -s measure-ampere VOLTAGE=3300 DURATION=0 FREQUENCY=1000 NAME=ota > result.json &
