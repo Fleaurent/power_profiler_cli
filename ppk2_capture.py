@@ -186,6 +186,9 @@ def cmd_measure(args):
                 raise SystemExit("Aborted while settling, nothing recorded")
         else:
             ppk2.toggle_DUT_power("OFF")  # measure from a cold start, switched on by power_on below
+    else:
+        # Ampere mode also routes VIN -> VOUT through the DUT power switch: OFF = DUT cut off, ~0 uA recorded
+        ppk2.toggle_DUT_power("ON")
 
     # Reader thread only drains the serial port so no data is lost; parsing happens here.
     chunks = queue.Queue()
@@ -276,8 +279,7 @@ def cmd_measure(args):
         drain(ppk2)
         progress.finish(i_sum, n_total)
 
-    if args.mode == "source":
-        ppk2.toggle_DUT_power("OFF")
+    ppk2.toggle_DUT_power("OFF")
 
     duration_s = n_total / PPK2_SAMPLE_RATE
     avg_ua = i_sum / n_total if n_total else None

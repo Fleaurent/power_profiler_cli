@@ -92,7 +92,7 @@ Examples:
 | Target | Mode | Wiring |
 |--------|------|--------|
 | `measure-voltage` | Source meter: the PPK2 **outputs** `VOLTAGE` on VOUT and measures the current | DUT supplied from PPK2 VOUT/GND |
-| `measure-ampere` | Ampere meter: the PPK2 sits in series and outputs **nothing** | external supply → VIN, VOUT → DUT, GND shared |
+| `measure-ampere` | Ampere meter: the PPK2 sits in series and outputs **nothing**. VIN → VOUT is only connected **during the measurement** (DUT power switch), before/after the DUT is cut off | external supply → VIN, VOUT → DUT, GND shared |
 
 | Parameter | Required | Valid values | Meaning |
 |-----------|----------|--------------|---------|
